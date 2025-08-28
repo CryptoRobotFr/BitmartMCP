@@ -977,7 +977,9 @@ async def calculate_position_risk(historical_days: int = 45) -> Dict[str, Any]:
         balance = await client.get_balance()
 
         position_risks = []
-        portfolio_returns_by_horizon = {horizon: None for horizon in time_horizons}
+        # Store returns for each position for proper portfolio VaR calculation
+        position_returns_by_horizon = {horizon: {} for horizon in time_horizons}
+        position_weights = {}
         total_position_value = 0
 
         # Calculate risk for each position
@@ -991,6 +993,9 @@ async def calculate_position_risk(historical_days: int = 45) -> Dict[str, Any]:
                     position.pair, "1h", limit=data_points_needed
                 )
 
+                # Store position weight
+                position_weights[position.pair] = position.usd_size
+                
                 # Calculate VaR for each time horizon
                 position_var = {}
                 var_1h_pct = None  # Store 1h VaR for sqrt scaling
@@ -1023,19 +1028,8 @@ async def calculate_position_risk(historical_days: int = 45) -> Dict[str, Any]:
                         if horizon_name == "1h":
                             var_1h_pct = var_pct
 
-                        # Aggregate returns for portfolio VaR (except 1w which uses scaling)
-                        weighted_returns = returns * (position.usd_size / balance.total)
-                        if portfolio_returns_by_horizon[horizon_name] is None:
-                            portfolio_returns_by_horizon[horizon_name] = (
-                                weighted_returns
-                            )
-                        else:
-                            # Align indices before adding
-                            portfolio_returns_by_horizon[horizon_name] = (
-                                portfolio_returns_by_horizon[horizon_name].add(
-                                    weighted_returns, fill_value=0
-                                )
-                            )
+                        # Store returns for portfolio calculation (not weighted yet)
+                        position_returns_by_horizon[horizon_name][position.pair] = returns
 
                 # Calculate additional risk metrics (using daily returns)
                 daily_returns = (ohlcv["close"] / ohlcv["close"].shift(24) - 1).dropna()
@@ -1093,7 +1087,7 @@ async def calculate_position_risk(historical_days: int = 45) -> Dict[str, Any]:
                     }
                 )
 
-        # Calculate portfolio-level VaR for each horizon
+        # Calculate portfolio-level VaR for each horizon with proper correlation handling
         portfolio_var = {}
         portfolio_var_1h_pct = None
 
@@ -1109,15 +1103,34 @@ async def calculate_position_risk(historical_days: int = 45) -> Dict[str, Any]:
                         "pct_of_balance": round((var_dollar / balance.total) * 100, 2),
                     }
             else:
-                returns = portfolio_returns_by_horizon[horizon_name]
-                if returns is not None and len(returns) > 0:
-                    var_pct = abs(np.percentile(returns * 100, 1))  # 99% confidence
+                # Get returns for all positions for this horizon
+                returns_dict = position_returns_by_horizon[horizon_name]
+                
+                if returns_dict and len(returns_dict) > 0:
+                    # Create DataFrame with all position returns aligned by timestamp
+                    returns_df = pd.DataFrame(returns_dict)
+                    
+                    # Forward fill missing values (when positions have different trading times)
+                    returns_df = returns_df.ffill().fillna(0)
+                    
+                    # Calculate portfolio returns with proper weighting
+                    # This accounts for actual correlations between assets
+                    weights = np.array([position_weights[pair] for pair in returns_df.columns])
+                    weights = weights / weights.sum()  # Normalize to sum to 1
+                    
+                    # Calculate portfolio returns as weighted sum
+                    portfolio_returns = (returns_df * weights).sum(axis=1)
+                    
+                    # Calculate VaR 99% on portfolio returns
+                    var_pct = abs(np.percentile(portfolio_returns * 100, 1))
                     var_dollar = var_pct / 100 * total_position_value
+                    
                     portfolio_var[horizon_name] = {
                         "pct": round(var_pct, 2),
                         "usd": round(var_dollar, 2),
                         "pct_of_balance": round((var_dollar / balance.total) * 100, 2),
                     }
+                    
                     # Store 1h for scaling
                     if horizon_name == "1h":
                         portfolio_var_1h_pct = var_pct
